@@ -1,0 +1,111 @@
+- name: Prepare OpenBSD host for an isolated GitHub runner VM
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Verify operating system before making changes
+      ansible.builtin.raw: uname -sr
+      register: ci_os
+      changed_when: false
+      check_mode: false
+    - name: Require the reviewed OpenBSD release
+      ansible.builtin.assert:
+        that: ci_os.stdout | trim == 'OpenBSD 8.0'
+    - name: Discover existing Python without installing packages
+      ansible.builtin.raw: |
+        for p in /usr/local/bin/python3 /usr/local/bin/python3.*; do
+          case "$p" in *-*) continue ;; esac
+          if [ -x "$p" ] && "$p" -c 'import json, sys' 2>/dev/null; then
+            echo "$p"; exit 0
+          fi
+        done
+        echo 'Install a supported Python 3 package with pkg_add first' >&2
+        exit 1
+      register: ci_python
+      changed_when: false
+      check_mode: false
+    - name: Use discovered interpreter
+      ansible.builtin.set_fact:
+        ansible_python_interpreter: '{{ ci_python.stdout | trim }}'
+    - name: Collect platform facts
+      ansible.builtin.setup:
+    - name: Verify host resources and VM support
+      ansible.builtin.raw: |
+        set -eu
+        dmesg | egrep '(VMX/EPT|SVM/RVI)'
+        test -f /etc/firmware/vmm-bios
+        df -Pk /home | awk 'NR == 2 { if ($4 < 15728640) exit 1 }'
+      changed_when: false
+      check_mode: false
+
+  tasks:
+    - name: Create private VM storage on home filesystem
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0700'
+      loop:
+        - /home/vmm-ci
+        - /home/vmm-ci/base
+        - /home/vmm-ci/runtime
+
+    - name: Install VM lifecycle script
+      ansible.builtin.copy:
+        src: ../../openbsd/run-vm.sh
+        dest: /usr/local/sbin/ci-run-vm
+        owner: root
+        group: wheel
+        mode: '0700'
+        validate: /bin/sh -n %s
+
+    - name: Stage persistent host configuration without any CI VM definition
+      ansible.builtin.copy:
+        src: ../../openbsd/vmd-host.conf
+        dest: /home/vmm-ci/vm.conf.candidate
+        owner: root
+        group: wheel
+        mode: '0600'
+        validate: /usr/sbin/vmd -n -f %s
+
+    - name: Install runtime VM configuration for validation after disk creation
+      ansible.builtin.copy:
+        src: ../../openbsd/vm.conf.example
+        dest: /home/vmm-ci/job.vm.conf
+        owner: root
+        group: wheel
+        mode: '0600'
+
+    - name: Stage firewall filter fragment without changing the live firewall
+      ansible.builtin.copy:
+        src: ../../openbsd/pf-ci.conf.example
+        dest: /home/vmm-ci/pf-ci.conf.candidate
+        owner: root
+        group: wheel
+        mode: '0600'
+
+    - name: Inspect existing base image
+      ansible.builtin.stat:
+        path: /home/vmm-ci/base/github.qcow2
+      register: ci_base
+    - name: Refuse to overwrite an existing base image
+      ansible.builtin.assert:
+        that: not ci_base.stat.exists
+        fail_msg: Existing base preserved. Update it through a separate maintenance procedure.
+      when: ci_base_image_src | length > 0
+    - name: Transfer optional clean base image
+      ansible.builtin.copy:
+        src: '{{ ci_base_image_src }}'
+        dest: /home/vmm-ci/base/github.qcow2
+        owner: root
+        group: wheel
+        mode: '0400'
+      when: ci_base_image_src | length > 0
+
+    - name: Report remaining activation steps
+      ansible.builtin.debug:
+        msg:
+          - 'Staged only: merge candidates into vm.conf/pf.conf using README instructions.'
+          - 'No VM was started, forwarding enabled, or firewall reloaded.'
+          - 'Target repository: {{ ci_repo_url }}'

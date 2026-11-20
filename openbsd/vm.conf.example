@@ -1,0 +1,14 @@
+# Runtime-only configuration; DO NOT merge into /etc/vm.conf.
+# Load only after creating /home/vmm-ci/runtime/job.qcow2.
+# Never enable local inet6 for this isolated IPv4-only runner network.
+vm "ci-runner" {
+    disable
+    memory 8G
+    cpus 2
+    disk "/home/vmm-ci/runtime/job.qcow2"
+    cdrom "/home/vmm-ci/runtime/job-seed.iso"
+    local interface tap8 {
+        group ci
+        locked lladdr 02:00:00:00:08:01
+    }
+}

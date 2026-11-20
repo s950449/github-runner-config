@@ -1,0 +1,168 @@
+- import_playbook: host.yml
+
+- name: Activate isolated CI networking on the inspected OpenBSD host
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require normal execution for the activation transaction
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: Use host.yml --check for staging; activation requires a real transaction.
+    - name: Check tap8 before reserving the CI interface
+      ansible.builtin.command: /sbin/ifconfig tap8
+      register: ci_tap
+      failed_when: false
+      changed_when: false
+    - name: Refuse to reuse an interface that is not already assigned to CI
+      ansible.builtin.assert:
+        that: ci_tap.rc != 0 or ci_tap.stdout is search('groups:.*\bci\b')
+        fail_msg: tap8 already exists outside the CI group; inspect it before proceeding.
+    - name: Create reserved CI interface
+      ansible.builtin.command: /sbin/ifconfig tap8 create group ci
+      when: ci_tap.rc != 0
+    - name: Persist CI interface across boots
+      ansible.builtin.copy:
+        dest: /etc/hostname.tap8
+        content: "group ci\n"
+        owner: root
+        group: wheel
+        mode: '0600'
+        force: false
+
+    - name: Ensure fixed interface has a device node
+      ansible.builtin.import_tasks: tasks/tap-device.yml
+
+    - name: Read current firewall configuration
+      ansible.builtin.slurp:
+        src: /etc/pf.conf
+      register: ci_pf
+    - name: Require the inspected policy and no tap filtering bypass
+      ansible.builtin.assert:
+        that:
+          - (ci_pf.content | b64decode) is search('(?m)^set skip on lo\s*$')
+          - (ci_pf.content | b64decode) is search('(?m)^pass in on iwx0 proto tcp to port 22 keep state\s*$')
+          - (ci_pf.content | b64decode) is search('(?m)^pass in on em0 proto tcp to port 22 keep state\s*$')
+          - not ((ci_pf.content | b64decode) is search('(?m)^set skip on .*\b(ci|tap|tap8)\b'))
+    - name: Install the CI filter include
+      ansible.builtin.copy:
+        src: ../../openbsd/pf-ci.conf.example
+        dest: /etc/pf-ci.conf
+        owner: root
+        group: wheel
+        mode: '0600'
+        validate: /sbin/pfctl -nf %s
+    - name: Prepare full firewall candidate from the existing configuration
+      ansible.builtin.copy:
+        content: '{{ ci_pf.content | b64decode }}'
+        dest: /home/vmm-ci/pf.conf.candidate
+        owner: root
+        group: wheel
+        mode: '0600'
+      changed_when: false
+    - name: Add NAT and early CI filters without altering existing SSH rules
+      ansible.builtin.blockinfile:
+        path: /home/vmm-ci/pf.conf.candidate
+        marker: '# {mark} ANSIBLE CI NETWORK'
+        insertafter: '^set skip on lo\s*$'
+        block: |
+          match out on egress inet from 100.64.0.0/10 to any nat-to (egress)
+          include "/etc/pf-ci.conf"
+        validate: /sbin/pfctl -nf %s
+    - name: Validate the complete firewall candidate
+      ansible.builtin.command: /sbin/pfctl -nf /home/vmm-ci/pf.conf.candidate
+      changed_when: false
+
+    - name: Keep persistent vmd configuration free of transient CI definitions
+      ansible.builtin.blockinfile:
+        path: /etc/vm.conf
+        create: true
+        owner: root
+        group: wheel
+        mode: '0600'
+        backup: true
+        marker: '# {mark} ANSIBLE CI VM'
+        block: '{{ lookup("ansible.builtin.file", "../../openbsd/vmd-host.conf") }}'
+        validate: /usr/sbin/vmd -n -f %s
+
+    - name: Apply firewall with an independent timed rollback
+      block:
+        - name: Create private rollback transaction directory
+          ansible.builtin.tempfile:
+            state: directory
+            path: /home/vmm-ci/runtime
+            prefix: pf-rollback-
+          register: ci_transaction
+        - name: Save current firewall policy
+          ansible.builtin.copy:
+            src: /etc/pf.conf
+            remote_src: true
+            dest: '{{ ci_transaction.path }}/pf.conf'
+            mode: '0600'
+        - name: Arm rollback marker
+          ansible.builtin.copy:
+            dest: '{{ ci_transaction.path }}/pending'
+            content: "pending\n"
+            mode: '0600'
+        - name: Launch rollback independently of the SSH connection
+          ansible.builtin.shell: |
+            sleep 180
+            if mv {{ (ci_transaction.path ~ '/pending') | quote }} {{ (ci_transaction.path ~ '/rollback-triggered') | quote }} 2>/dev/null; then
+              cp {{ (ci_transaction.path ~ '/pf.conf') | quote }} /etc/pf.conf
+              /sbin/pfctl -f /etc/pf.conf
+            fi
+          async: 240
+          poll: 0
+          register: ci_rollback_job
+        - name: Install the validated firewall candidate
+          ansible.builtin.copy:
+            src: /home/vmm-ci/pf.conf.candidate
+            remote_src: true
+            dest: /etc/pf.conf
+            owner: root
+            group: wheel
+            mode: '0600'
+            validate: /sbin/pfctl -nf %s
+        - name: Load firewall policy
+          ansible.builtin.command: /sbin/pfctl -f /etc/pf.conf
+          changed_when: true
+        - name: Close existing SSH connection to test a fresh one
+          ansible.builtin.meta: reset_connection
+        - name: Verify SSH reconnection
+          ansible.builtin.wait_for_connection:
+            timeout: 45
+        - name: Disarm rollback after successful reconnect
+          ansible.builtin.command:
+            argv:
+              - /bin/mv
+              - '{{ ci_transaction.path }}/pending'
+              - '{{ ci_transaction.path }}/committed'
+          changed_when: true
+      rescue:
+        - name: Report armed rollback and stop activation
+          ansible.builtin.fail:
+            msg: 'Activation failed. If armed, host rollback restores pf.conf within 180 seconds. Do not start a VM; inspect the transaction directory and firewall.'
+
+    - name: Persist IPv4 forwarding
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        create: true
+        owner: root
+        group: wheel
+        mode: '0600'
+        regexp: '^net\.inet\.ip\.forwarding='
+        line: net.inet.ip.forwarding=1
+    - name: Enable IPv4 forwarding now
+      ansible.builtin.command: /sbin/sysctl net.inet.ip.forwarding=1
+      changed_when: true
+    - name: Enable vmd at boot
+      ansible.builtin.command: /usr/sbin/rcctl enable vmd
+      changed_when: false
+    - name: Verify vmd and load persistent host configuration
+      ansible.builtin.import_tasks: tasks/vmd-ready.yml
+    - name: Display activation result
+      ansible.builtin.debug:
+        msg:
+          - '{{ ci_vm_status.stdout_lines }}'
+          - 'Host networking activated; no runner VM or job was started.'
+          - 'Next: install Ubuntu base, validate network isolation, then register an ephemeral runner.'

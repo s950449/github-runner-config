@@ -1,0 +1,37 @@
+- name: Inspect OpenBSD without installing Python or changing the host
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read OS, identity, VM capability, disk, Python, and network configuration
+      ansible.builtin.raw: |
+        uname -sr
+        id
+        dmesg | egrep '(VMX/EPT|SVM/RVI)' || true
+        df -h / /home /var
+        command -v python3 || ls /usr/local/bin/python3.* 2>/dev/null || true
+        ifconfig tap8 2>/dev/null || true
+        cat /etc/vm.conf 2>/dev/null || true
+        cat /etc/pf.conf
+      register: ci_preflight
+      changed_when: false
+      check_mode: false
+
+    - name: Display collected preflight information
+      ansible.builtin.debug:
+        var: ci_preflight.stdout_lines
+
+- name: Confirm doas access without changing the host
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read privileged identity
+      ansible.builtin.raw: id
+      register: ci_privileged_identity
+      changed_when: false
+      check_mode: false
+
+    - name: Display privileged identity
+      ansible.builtin.debug:
+        var: ci_privileged_identity.stdout_lines

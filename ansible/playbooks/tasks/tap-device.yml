@@ -1,0 +1,21 @@
+- name: Inspect fixed tap8 character device
+  ansible.builtin.stat:
+    path: /dev/tap8
+  register: ci_tap_device
+- name: Refuse to replace an unexpected existing path
+  ansible.builtin.assert:
+    that: not ci_tap_device.stat.exists or ci_tap_device.stat.ischr | default(false)
+    fail_msg: '/dev/tap8 exists but is not a character device; inspect it manually.'
+- name: Create missing tap8 device node using OpenBSD MAKEDEV
+  ansible.builtin.command:
+    argv: [/bin/sh, /dev/MAKEDEV, tap8]
+    chdir: /dev
+    creates: /dev/tap8
+  when: not ci_tap_device.stat.exists
+- name: Verify tap8 device node
+  ansible.builtin.stat:
+    path: /dev/tap8
+  register: ci_tap_device_ready
+- name: Require tap8 character device
+  ansible.builtin.assert:
+    that: ci_tap_device_ready.stat.ischr | default(false)

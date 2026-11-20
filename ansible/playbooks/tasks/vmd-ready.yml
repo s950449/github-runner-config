@@ -1,0 +1,71 @@
+- name: Validate vmd configuration before starting the service
+  ansible.builtin.command: /usr/sbin/vmd -n -f /etc/vm.conf
+  changed_when: false
+
+- name: Start and verify vmd control interface
+  vars:
+    ci_empty_status_header: '^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'
+  block:
+    - name: Check whether vmd is running
+      ansible.builtin.command: /usr/sbin/rcctl check vmd
+      register: ci_vmd
+      changed_when: false
+      failed_when: false
+    - name: Start vmd if necessary
+      ansible.builtin.command: /usr/sbin/rcctl start vmd
+      when: ci_vmd.rc != 0
+    - name: Wait until vmctl can communicate with vmd
+      ansible.builtin.command: /usr/sbin/vmctl status
+      register: ci_vmd_ready
+      changed_when: false
+      failed_when: false
+      until: >-
+        ci_vmd_ready.rc == 0 or
+        (ci_vmd_ready.rc == 1 and ci_vmd_ready.stderr | trim == '' and
+         ci_vmd_ready.stdout is match(ci_empty_status_header))
+      retries: 10
+      delay: 2
+    - name: Reload persistent configuration without starting a VM
+      ansible.builtin.command: /usr/sbin/vmctl reload
+      changed_when: true
+    - name: Read VM configuration state after reload
+      ansible.builtin.command: /usr/sbin/vmctl status
+      register: ci_vm_status
+      changed_when: false
+      failed_when: >-
+        not (ci_vm_status.rc == 0 or
+        (ci_vm_status.rc == 1 and ci_vm_status.stderr | trim == '' and
+         ci_vm_status.stdout is match(ci_empty_status_header)))
+    - name: Display vmd state
+      ansible.builtin.debug:
+        var: ci_vm_status.stdout_lines
+  rescue:
+    - name: Collect vmd diagnostics without restarting or deleting sockets
+      ansible.builtin.raw: |
+        echo '--- service check ---'
+        /usr/sbin/rcctl check vmd 2>&1
+        echo '--- service settings ---'
+        /usr/sbin/rcctl get vmd 2>&1
+        echo '--- config validation ---'
+        /usr/sbin/vmd -n -f /etc/vm.conf 2>&1
+        echo '--- socket ---'
+        ls -l /var/run/vmd.sock 2>&1
+        echo '--- vmd processes ---'
+        ps -ax -o pid,ppid,user,command | awk 'NR == 1 || /[v]md/'
+        echo '--- recent vmd messages ---'
+        for log in /var/log/daemon /var/log/messages; do
+          if [ -r "$log" ]; then
+            echo "$log"
+            tail -n 300 "$log" | awk '/[v]md/' | tail -n 40
+          fi
+        done
+        true
+      register: ci_vmd_diagnostics
+      changed_when: false
+      failed_when: false
+    - name: Display collected diagnostics
+      ansible.builtin.debug:
+        var: ci_vmd_diagnostics.stdout_lines
+    - name: Stop without guessing the service failure cause
+      ansible.builtin.fail:
+        msg: 'vmd is not healthy. Share the diagnostic output; no firewall changes were made by these tasks and no VM was started.'

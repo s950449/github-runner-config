@@ -1,0 +1,21 @@
+# Filter fragment, NOT a replacement for /etc/pf.conf.
+# Include before existing broad pass/quick rules. Do not skip filtering on ci/tap8.
+# Replace public DNS if needed. Add ALL internal globally routed IPv4 prefixes,
+# VPN routes, public hairpin addresses and management endpoints to this table.
+table <ci_denied> const { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, \
+    127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, \
+    224.0.0.0/4, 240.0.0.0/4 }
+
+# Deny IPv6, source spoofing, host access and private destinations first.
+block drop in quick on ci inet6 all
+pass in quick on ci inet proto udp from { 0.0.0.0/32 100.64.0.0/10 } \
+    port 68 to { 255.255.255.255 (ci) } port 67
+block drop in quick on ci inet from ! 100.64.0.0/10 to any
+block drop in quick on ci inet to self
+block drop in quick on ci inet to <ci_denied>
+pass in quick on ci inet proto { udp tcp } to 1.1.1.1 port 53
+pass in quick on ci inet proto tcp to any port { 80 443 }
+block drop in quick on ci all
+
+# NAT must be integrated separately in the main ruleset (see README).
+# HTTP(S) access is broad: it does NOT prevent exfiltration.

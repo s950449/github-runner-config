@@ -1,0 +1,38 @@
+- name: Resume only vmd activation without changing the firewall
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Verify the intended OpenBSD release
+      ansible.builtin.command: /usr/bin/uname -sr
+      register: ci_os
+      changed_when: false
+    - name: Require OpenBSD 8.0 and normal execution
+      ansible.builtin.assert:
+        that:
+          - ci_os.stdout | trim == 'OpenBSD 8.0'
+          - not ansible_check_mode
+    - name: Replace the managed diskless template with on-demand loading policy
+      ansible.builtin.blockinfile:
+        path: /etc/vm.conf
+        marker: '# {mark} ANSIBLE CI VM'
+        block: '{{ lookup("ansible.builtin.file", "../../openbsd/vmd-host.conf") }}'
+        backup: true
+        validate: /usr/sbin/vmd -n -f %s
+    - name: Install corrected lifecycle script
+      ansible.builtin.copy:
+        src: ../../openbsd/run-vm.sh
+        dest: /usr/local/sbin/ci-run-vm
+        owner: root
+        group: wheel
+        mode: '0700'
+        validate: /bin/sh -n %s
+    - name: Install on-demand job configuration
+      ansible.builtin.copy:
+        src: ../../openbsd/vm.conf.example
+        dest: /home/vmm-ci/job.vm.conf
+        owner: root
+        group: wheel
+        mode: '0600'
+    - name: Verify vmd without starting a VM
+      ansible.builtin.import_tasks: tasks/vmd-ready.yml
