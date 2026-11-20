@@ -1,0 +1,14 @@
+#!/bin/ksh
+daemon="/usr/local/bin/python3"
+daemon_flags="-u /usr/local/libexec/ci-controller.py /etc/ci-runner/config.json"
+daemon_logger="daemon.info"
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_configtest() {
+    ${daemon} /usr/local/libexec/ci-controller.py /etc/ci-runner/config.json --validate
+}
+
+rc_cmd $1

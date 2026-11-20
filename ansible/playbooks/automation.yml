@@ -1,0 +1,148 @@
+- name: Deploy single-capacity GitHub App JIT controller
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Check existing controller before deployment
+      ansible.builtin.command: /usr/sbin/rcctl check ci_controller
+      register: ci_existing_controller
+      changed_when: false
+      failed_when: false
+      check_mode: false
+    - name: Require existing controller to be stopped before updating its files
+      ansible.builtin.assert:
+        that: ci_existing_controller.rc != 0
+        fail_msg: 'Wait for the current job, stop ci_controller with rcctl, then deploy. Do not replace lifecycle code while it is active.'
+    - name: Require App identifiers and local private key path
+      ansible.builtin.assert:
+        that:
+          - ci_app_id | int > 0
+          - ci_app_installation_id | int > 0
+          - ci_app_private_key_file | length > 0
+          - ci_app_private_key_file is match('^/')
+          - ci_repo_url is match('^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+        fail_msg: 'Set ci_app_private_key_file to the downloaded local PEM path; never paste key contents.'
+    - name: Require intended OS and prepared base
+      ansible.builtin.raw: |
+        set -eu
+        test "$(uname -sr)" = 'OpenBSD 8.0'
+        test -f /home/vmm-ci/base/github.qcow2
+        test -f /home/vmm-ci/job.vm.conf
+        test -f /home/vmm-ci/job-seed/network-config
+        test -c /dev/tap8
+        test ! -e /home/vmm-ci/build.lock
+        /usr/sbin/rcctl check vmd
+      changed_when: false
+      check_mode: false
+    - name: Require no active VM before replacing lifecycle programs
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_auto_vms
+      changed_when: false
+      check_mode: false
+      failed_when: >-
+        not (ci_auto_vms.rc in [0, 1] and ci_auto_vms.stderr | trim == '' and
+        ci_auto_vms.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'))
+    - name: Require no active or unresolved VM capacity lock
+      ansible.builtin.raw: test ! -e /home/vmm-ci/runtime/lock
+      changed_when: false
+      check_mode: false
+  tasks:
+    - name: Create private controller directory
+      ansible.builtin.file:
+        path: /etc/ci-runner
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0700'
+    - name: Copy GitHub App private key without logging or diff
+      ansible.builtin.copy:
+        src: '{{ ci_app_private_key_file }}'
+        dest: /etc/ci-runner/app.pem
+        owner: root
+        group: wheel
+        mode: '0600'
+      no_log: true
+      diff: false
+    - name: Write explicit repository and workflow policy
+      ansible.builtin.copy:
+        dest: /etc/ci-runner/config.json
+        owner: root
+        group: wheel
+        mode: '0600'
+        content: |
+          {{ {
+            'repo': ci_repo_url | regex_replace('^https://github.com/', ''),
+            'auth': {'app_id': ci_app_id | int, 'installation_id': ci_app_installation_id | int,
+                     'private_key_file': '/etc/ci-runner/app.pem'},
+            'workflows': ci_controller_workflows,
+            'poll_seconds': 60,
+            'idle_seconds': 300,
+            'runner_group_id': 1
+          } | to_nice_json }}
+    - name: Create local executable directory
+      ansible.builtin.file:
+        path: /usr/local/libexec
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0755'
+    - name: Install controller
+      ansible.builtin.copy:
+        src: ../../openbsd/controller.py
+        dest: /usr/local/libexec/ci-controller.py
+        owner: root
+        group: wheel
+        mode: '0700'
+    - name: Install manual and automated VM lifecycle program
+      ansible.builtin.copy:
+        src: ../../openbsd/run-vm.sh
+        dest: /usr/local/sbin/ci-run-vm
+        owner: root
+        group: wheel
+        mode: '0700'
+        validate: /bin/sh -n %s
+    - name: Validate controller policy and private key permissions
+      ansible.builtin.command: /usr/local/bin/python3 /usr/local/libexec/ci-controller.py /etc/ci-runner/config.json --validate
+      changed_when: false
+      when: not ansible_check_mode
+    - name: Verify App authentication and read API permissions without dispatching
+      ansible.builtin.command: /usr/local/bin/python3 /usr/local/libexec/ci-controller.py /etc/ci-runner/config.json --check
+      changed_when: false
+      when: not ansible_check_mode
+    - name: Install rc.d service
+      ansible.builtin.copy:
+        src: ../../openbsd/ci_controller.rc
+        dest: /etc/rc.d/ci_controller
+        owner: root
+        group: wheel
+        mode: '0755'
+        validate: /bin/ksh -n %s
+    - name: Enable service at boot
+      ansible.builtin.command: /usr/sbin/rcctl enable ci_controller
+      when: ci_controller_enabled | bool and not ansible_check_mode
+    - name: Allow time for graceful VM and API cleanup during service stop
+      ansible.builtin.command: /usr/sbin/rcctl set ci_controller timeout 120
+      when: not ansible_check_mode
+    - name: Check current service state
+      ansible.builtin.command: /usr/sbin/rcctl check ci_controller
+      register: ci_auto_service
+      changed_when: false
+      failed_when: false
+      when: not ansible_check_mode
+    - name: Start or restart service after validation
+      ansible.builtin.command:
+        argv:
+          - /usr/sbin/rcctl
+          - '{{ "restart" if ci_auto_service.rc == 0 else "start" }}'
+          - ci_controller
+      when: ci_controller_enabled | bool and not ansible_check_mode
+    - name: Keep staged-only service disabled at boot
+      ansible.builtin.command: /usr/sbin/rcctl disable ci_controller
+      when: not ci_controller_enabled | bool and not ansible_check_mode
+    - name: Explain automatic execution
+      ansible.builtin.debug:
+        msg:
+          - 'Controller polls {{ ci_repo_url }} every 60 seconds, one VM at a time.'
+          - 'Allowed workflows: {{ ci_controller_workflows }}'
+          - 'Once enabled, matching queued jobs execute without further confirmation.'
+          - 'Observe: doas rcctl check ci_controller; doas tail -n 100 /var/log/daemon'

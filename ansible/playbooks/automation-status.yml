@@ -1,0 +1,53 @@
+- name: Inspect automatic runner host state without changing services or VMs
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read controller, VM, session metadata and recent diagnostics
+      ansible.builtin.raw: |
+        echo '--- controller service ---'
+        /usr/sbin/rcctl check ci_controller 2>&1
+        echo '--- all VM states ---'
+        /usr/sbin/vmctl status 2>&1
+        echo '--- runtime files (names and metadata only) ---'
+        ls -la /home/vmm-ci/runtime 2>&1
+        echo '--- session markers ---'
+        ls -l /home/vmm-ci/runtime/lock/session /home/vmm-ci/runtime/lock/manager_pid /home/vmm-ci/runtime/lock/launching 2>&1
+        echo '--- controller and manager processes ---'
+        ps -axww -o pid,ppid,user,command | awk 'NR == 1 || /[c]i-controller\.py|[c]i-run-vm/'
+        echo '--- durable state (no tokens) ---'
+        /usr/local/bin/python3 - <<'PY'
+        import json
+        from pathlib import Path
+        path = Path('/home/vmm-ci/auto-state.json')
+        if path.exists():
+            state = json.loads(path.read_text())
+            print(json.dumps({key: state.get(key) for key in
+                ['session', 'runner_name', 'runner_id', 'job_id', 'created_at']}, ensure_ascii=True))
+        else:
+            print('No auto-state.json')
+        PY
+        echo '--- recent controller and vmd logs ---'
+        tail -n 400 /var/log/daemon | awk '/ci_controller\[[0-9]+\]:|[v]md\[[0-9]+\]:/' | tail -n 80
+        true
+      register: ci_auto_diagnostics
+      changed_when: false
+      check_mode: false
+    - name: Display automatic runner diagnostics
+      ansible.builtin.debug:
+        var: ci_auto_diagnostics.stdout_lines
+    - name: Read actual GitHub job and runner status without dispatching
+      ansible.builtin.script:
+        cmd: '{{ (playbook_dir ~ "/../../openbsd/controller_status.py") | quote }} --job-id {{ ci_diagnostic_job_id | default(0) | int }}'
+        executable: /usr/local/bin/python3
+      register: ci_github_diagnostics
+      changed_when: false
+      failed_when: false
+      check_mode: false
+    - name: Display GitHub status snapshot
+      ansible.builtin.debug:
+        var: ci_github_diagnostics.stdout_lines
+    - name: Display GitHub diagnostic errors if present
+      ansible.builtin.debug:
+        var: ci_github_diagnostics.stderr_lines
+      when: ci_github_diagnostics.rc != 0
