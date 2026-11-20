@@ -1,0 +1,18 @@
+- name: Diagnose and resume prepared build VM without reconverting disks
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require intended release and a live build reservation
+      ansible.builtin.raw: |
+        set -eu
+        test "$(uname -sr)" = 'OpenBSD 8.0'
+        test -d /home/vmm-ci/build.lock
+        test -d /home/vmm-ci/runtime/lock
+        /usr/sbin/rcctl check vmd
+      changed_when: false
+    - name: Require normal execution
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+    - name: Verify resources and resume startup
+      ansible.builtin.import_tasks: tasks/build-vm-start.yml

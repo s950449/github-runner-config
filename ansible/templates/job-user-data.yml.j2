@@ -1,0 +1,11 @@
+#cloud-config
+disable_root: true
+ssh_pwauth: false
+users:
+  - name: gha-runner
+    lock_passwd: true
+    shell: /bin/bash
+    groups: ''
+    sudo: null
+    ssh_authorized_keys:
+      - {{ ci_builder_public_key | to_json }}

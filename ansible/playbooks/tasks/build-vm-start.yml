@@ -1,0 +1,82 @@
+- name: Require no running VMs before using the shared CI interface
+  ansible.builtin.command: /usr/sbin/vmctl status -r
+  register: ci_start_status
+  changed_when: false
+  failed_when: >-
+    not (ci_start_status.rc in [0, 1] and ci_start_status.stderr | trim == '' and
+    ci_start_status.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'))
+- name: Inspect required VM media and device paths
+  ansible.builtin.stat:
+    path: '{{ item }}'
+  loop:
+    - /dev/vmm
+    - /dev/tap8
+    - /etc/firmware/vmm-bios
+    - /home/vmm-ci/base/build.qcow2
+    - /home/vmm-ci/build-seed.iso
+  register: ci_start_paths
+- name: Display exact path availability
+  ansible.builtin.debug:
+    msg: '{{ item.item }}: exists={{ item.stat.exists }}, character_device={{ item.stat.ischr | default(false) }}, regular_file={{ item.stat.isreg | default(false) }}'
+  loop: '{{ ci_start_paths.results }}'
+  loop_control:
+    label: '{{ item.item }}'
+- name: Require VMM device and real boot media
+  ansible.builtin.assert:
+    that:
+      - ci_start_paths.results[0].stat.ischr | default(false)
+      - ci_start_paths.results[2].stat.isreg | default(false)
+      - ci_start_paths.results[3].stat.isreg | default(false)
+      - ci_start_paths.results[4].stat.isreg | default(false)
+    fail_msg: 'A required VMM/BIOS/disk/seed path is missing; see the path report. Nothing was deleted or rebuilt.'
+- name: Ensure fixed interface has its device node
+  ansible.builtin.import_tasks: tap-device.yml
+- name: Install runtime build VM definition
+  ansible.builtin.copy:
+    src: '{{ playbook_dir }}/../files/build.vm.conf'
+    dest: /home/vmm-ci/build.vm.conf
+    mode: '0600'
+    validate: /usr/sbin/vmd -n -f %s
+- name: Load and start the prepared build VM
+  block:
+    - name: Remove stopped runtime definitions
+      ansible.builtin.command: /usr/sbin/vmctl reload
+    - name: Load runtime build VM definition
+      ansible.builtin.command: /usr/sbin/vmctl load /home/vmm-ci/build.vm.conf
+    - name: Start build VM
+      ansible.builtin.command: /usr/sbin/vmctl start ci-build
+  rescue:
+    - name: Collect actual vmd startup error
+      ansible.builtin.raw: |
+        /usr/sbin/rcctl check vmd 2>&1
+        /sbin/ifconfig tap8 2>&1
+        for log in /var/log/daemon /var/log/messages; do
+          if [ -r "$log" ]; then
+            echo "$log"
+            tail -n 400 "$log" | awk '/[v]md\[[0-9]+\]:/' | tail -n 30
+          fi
+        done
+        true
+      register: ci_start_diagnostics
+      changed_when: false
+    - name: Display VM startup diagnostics
+      ansible.builtin.debug:
+        var: ci_start_diagnostics.stdout_lines
+    - name: Stop while preserving prepared disks
+      ansible.builtin.fail:
+        msg: 'VM start failed; share diagnostics above. Prepared cloud disk and seed were preserved.'
+- name: Read build VM address assignment
+  ansible.builtin.command: /usr/sbin/vmctl status
+  register: ci_build_status
+  changed_when: false
+- name: Find running build VM
+  ansible.builtin.set_fact:
+    ci_build_row: '{{ ci_build_status.stdout_lines | select("search", "\sci-build$") | first }}'
+- name: Display cloud-init verification commands
+  ansible.builtin.debug:
+    msg:
+      - 'Build guest IP: 100.64.{{ ci_build_row.split()[0] }}.3'
+      - 'Console: ssh -t {{ ansible_user }}@{{ ansible_host }} "doas vmctl console ci-build"'
+      - 'SSH: ssh -J {{ ansible_user }}@{{ ansible_host }} ci-builder@100.64.{{ ci_build_row.split()[0] }}.3'
+      - 'Check SSH host fingerprint from console before trusting it.'
+      - 'In guest: sudo cloud-init status --wait; sudo test -f /var/lib/ci-image-ready'

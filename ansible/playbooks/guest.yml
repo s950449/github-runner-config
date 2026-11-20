@@ -1,0 +1,78 @@
+- name: Prepare a clean Ubuntu VM before sealing the GitHub runner base
+  hosts: linux_builders
+  gather_facts: true
+  become: true
+  pre_tasks:
+    - name: Require expected OS and a verified runner release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version == '24.04'
+          - ansible_facts.architecture == 'x86_64'
+          - ci_runner_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+          - ci_runner_sha256 is match('^[a-fA-F0-9]{64}$')
+        fail_msg: Supply exact runner version and official SHA256 before installing.
+  tasks:
+    - name: Install essential tools and runner native dependencies
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - git
+          - tar
+          - libicu74
+          - libssl3t64
+          - zlib1g
+          - libkrb5-3
+          - liblttng-ust1t64
+        state: present
+        update_cache: true
+    - name: Create runner without supplemental groups or password login
+      ansible.builtin.user:
+        name: gha-runner
+        create_home: true
+        shell: /bin/bash
+        groups: ''
+        append: false
+        password_lock: true
+    - name: Protect home and create runner directory
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: directory
+        owner: gha-runner
+        group: gha-runner
+        mode: '0700'
+      loop:
+        - /home/gha-runner
+        - /home/gha-runner/actions-runner
+    - name: Check for registration or prior workload state
+      ansible.builtin.stat:
+        path: '/home/gha-runner/actions-runner/{{ item }}'
+      loop: ['.runner', '.credentials', '_work']
+      register: ci_registration
+    - name: Refuse to seal a registered or used runner
+      ansible.builtin.assert:
+        that: not item.stat.exists
+      loop: '{{ ci_registration.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+    - name: Download exact runner archive with official checksum
+      ansible.builtin.get_url:
+        url: 'https://github.com/actions/runner/releases/download/v{{ ci_runner_version }}/actions-runner-linux-x64-{{ ci_runner_version }}.tar.gz'
+        dest: '/var/tmp/actions-runner-{{ ci_runner_version }}.tar.gz'
+        checksum: 'sha256:{{ ci_runner_sha256 }}'
+        owner: root
+        mode: '0600'
+    - name: Extract runner as unprivileged account ownership
+      ansible.builtin.unarchive:
+        src: '/var/tmp/actions-runner-{{ ci_runner_version }}.tar.gz'
+        dest: /home/gha-runner/actions-runner
+        remote_src: true
+        owner: gha-runner
+        group: gha-runner
+    - name: Explain sealing and per-VM registration
+      ansible.builtin.debug:
+        msg:
+          - 'Guest prepared, not registered. Review/remove build admin access before sealing.'
+          - 'Register only a disposable clone to {{ ci_repo_url }} using --ephemeral.'
+          - 'Runner password is locked. From serial console admin: sudo -iu gha-runner.'

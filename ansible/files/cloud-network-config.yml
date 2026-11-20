@@ -1,0 +1,12 @@
+version: 2
+ethernets:
+  ci:
+    match:
+      macaddress: '02:00:00:00:08:02'
+    dhcp4: true
+    dhcp6: false
+    accept-ra: false
+    dhcp4-overrides:
+      use-dns: false
+    nameservers:
+      addresses: [1.1.1.1]

@@ -1,0 +1,136 @@
+- name: Build Ubuntu runner image with NoCloud on OpenBSD
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  pre_tasks:
+    - name: Require normal execution and validated artifact identifiers
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - ci_runner_version is match('^[0-9]+\.[0-9]+\.[0-9]+$')
+          - ci_runner_sha256 is match('^[a-fA-F0-9]{64}$')
+          - ci_cloud_image_sha256 is match('^[a-fA-F0-9]{64}$')
+    - name: Read public key on controller
+      ansible.builtin.set_fact:
+        ci_builder_public_key: '{{ lookup("ansible.builtin.file", ci_builder_public_key_file) | trim }}'
+    - name: Require a public key rather than private key material
+      ansible.builtin.assert:
+        that:
+          - ci_builder_public_key is match('^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^ ]+|sk-[^ ]+) [A-Za-z0-9+/=]+( .*)?$')
+    - name: Verify host release and available storage
+      ansible.builtin.raw: |
+        set -eu
+        test "$(uname -sr)" = 'OpenBSD 8.0'
+        /usr/sbin/rcctl check vmd
+        df -Pk /home | awk 'NR == 2 { if ($4 < 41943040) exit 1 }'
+      changed_when: false
+    - name: Read running VM list
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_running_vms
+      changed_when: false
+      failed_when: >-
+        not (ci_running_vms.rc in [0, 1] and ci_running_vms.stderr | trim == '' and
+        ci_running_vms.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'))
+    - name: Check for an active test session
+      ansible.builtin.stat:
+        path: /home/vmm-ci/runtime/lock
+      register: ci_job_lock
+    - name: Refuse concurrent build and test sessions
+      ansible.builtin.assert:
+        that: not ci_job_lock.stat.exists
+    - name: Preserve any existing build disk
+      ansible.builtin.stat:
+        path: /home/vmm-ci/base/build.qcow2
+      register: ci_existing_build
+    - name: Refuse to overwrite an earlier build
+      ansible.builtin.assert:
+        that: not ci_existing_build.stat.exists
+        fail_msg: 'build.qcow2 exists; inspect/resume or archive it before rebuilding. It will not be overwritten.'
+  tasks:
+    - name: Acquire shared capacity lock before building
+      ansible.builtin.command: /bin/mkdir /home/vmm-ci/runtime/lock
+    - name: Install lifecycle script with build-session protection
+      ansible.builtin.copy:
+        src: ../../openbsd/run-vm.sh
+        dest: /usr/local/sbin/ci-run-vm
+        mode: '0700'
+        validate: /bin/sh -n %s
+    - name: Reserve the host against runner jobs during image building
+      ansible.builtin.file:
+        path: /home/vmm-ci/build.lock
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0700'
+    - name: Install ISO creation utility from OpenBSD packages
+      community.general.openbsd_pkg:
+        name: xorriso
+        state: present
+    - name: Create private NoCloud seed directory
+      ansible.builtin.file:
+        path: /home/vmm-ci/build-seed
+        state: directory
+        owner: root
+        group: wheel
+        mode: '0700'
+    - name: Download pinned Ubuntu cloud image with SHA256 validation
+      ansible.builtin.get_url:
+        url: '{{ ci_cloud_image_url }}'
+        dest: /home/vmm-ci/ubuntu-cloud.qcow2
+        checksum: 'sha256:{{ ci_cloud_image_sha256 }}'
+        mode: '0600'
+        timeout: 60
+    - name: Render build cloud-config without GitHub credentials
+      ansible.builtin.template:
+        src: ../templates/cloud-user-data.yml.j2
+        dest: /home/vmm-ci/build-seed/user-data
+        mode: '0600'
+    - name: Create NoCloud metadata
+      ansible.builtin.copy:
+        dest: /home/vmm-ci/build-seed/meta-data
+        content: "instance-id: ci-build-v1\nlocal-hostname: ci-build\n"
+        mode: '0600'
+    - name: Install network configuration for the build MAC
+      ansible.builtin.copy:
+        src: ../files/cloud-network-config.yml
+        dest: /home/vmm-ci/build-seed/network-config
+        mode: '0600'
+    - name: Create private per-job seed source directory
+      ansible.builtin.file:
+        path: /home/vmm-ci/job-seed
+        state: directory
+        mode: '0700'
+    - name: Render nonprivileged per-job access configuration
+      ansible.builtin.template:
+        src: ../templates/job-user-data.yml.j2
+        dest: /home/vmm-ci/job-seed/user-data
+        mode: '0600'
+    - name: Install per-job MAC network configuration
+      ansible.builtin.copy:
+        src: ../files/job-network-config.yml
+        dest: /home/vmm-ci/job-seed/network-config
+        mode: '0600'
+    - name: Install seed-aware runtime VM configuration
+      ansible.builtin.copy:
+        src: ../../openbsd/vm.conf.example
+        dest: /home/vmm-ci/job.vm.conf
+        mode: '0600'
+    - name: Remove any old seed ISO before regeneration
+      ansible.builtin.file:
+        path: /home/vmm-ci/build-seed.iso
+        state: absent
+    - name: Create NoCloud cidata ISO
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/xorriso
+          - -as
+          - mkisofs
+          - -o
+          - /home/vmm-ci/build-seed.iso
+          - -V
+          - cidata
+          - -J
+          - -r
+          - /home/vmm-ci/build-seed
+    - name: Prepare compatible disk and start build VM
+      ansible.builtin.import_tasks: tasks/cloud-build-disk.yml

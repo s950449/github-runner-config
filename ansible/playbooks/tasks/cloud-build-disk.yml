@@ -1,0 +1,16 @@
+- name: Install QEMU image utility for compressed qcow2 normalization
+  community.general.openbsd_pkg:
+    name: qemu
+    state: present
+- name: Install cloud disk preparation script
+  ansible.builtin.copy:
+    src: '{{ playbook_dir }}/../../openbsd/prepare-build-disk.sh'
+    dest: /usr/local/sbin/ci-prepare-build-disk
+    owner: root
+    group: wheel
+    mode: '0700'
+    validate: /bin/sh -n %s
+- name: Normalize, verify, and expand cloud image before publishing build disk
+  ansible.builtin.command: /usr/local/sbin/ci-prepare-build-disk
+- name: Verify resources and start the prepared build VM
+  ansible.builtin.import_tasks: build-vm-start.yml

@@ -1,0 +1,83 @@
+#cloud-config
+hostname: ci-build
+manage_etc_hosts: true
+disable_root: true
+ssh_pwauth: false
+ssh_deletekeys: {{ (not (ci_preserve_host_keys | default(false))) | to_json }}
+users:
+  - name: ci-builder
+    lock_passwd: true
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh_authorized_keys:
+      - {{ ci_builder_public_key | to_json }}
+  - name: gha-runner
+    lock_passwd: true
+    shell: /bin/bash
+    groups: ''
+growpart:
+  mode: auto
+  devices: ['/']
+resize_rootfs: true
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - tar
+  - python3
+  - libicu74
+  - libssl3t64
+  - zlib1g
+  - libkrb5-3
+  - liblttng-ust1t64
+write_files:
+  - path: /usr/local/sbin/ci-seal-image
+    permissions: '0700'
+    content: |
+      #!/bin/sh
+      set -eu
+      test -f /var/lib/ci-image-ready
+      cloud-init status --wait
+      for entry in .runner .credentials _work; do
+        test ! -e "/home/gha-runner/actions-runner/$entry"
+      done
+      # Revoke build-only access; no registration or deployment secret was used.
+      rm -f /home/ci-builder/.ssh/authorized_keys
+      rm -f /etc/sudoers.d/90-cloud-init-users
+      usermod -L ci-builder
+      rm -f /etc/ssh/ssh_host_*key /etc/ssh/ssh_host_*key.pub
+      rm -f /root/.bash_history /home/ci-builder/.bash_history
+      cloud-init clean --logs --machine-id --seed
+      touch /var/lib/ci-image-sealed
+      systemctl poweroff
+  - path: /etc/default/grub.d/99-ci-serial.cfg
+    permissions: '0644'
+    content: |
+      GRUB_TERMINAL=serial
+      GRUB_SERIAL_COMMAND="serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1"
+      GRUB_CMDLINE_LINUX="console=ttyS0,115200n8"
+  - path: /usr/local/sbin/ci-prepare-runner
+    permissions: '0700'
+    content: |
+      #!/bin/sh
+      set -eu
+      umask 077
+      cloud-init schema --system
+      archive=/var/tmp/actions-runner.tar.gz
+      curl --fail --location --retry 3 --proto '=https' \
+        'https://github.com/actions/runner/releases/download/v{{ ci_runner_version }}/actions-runner-linux-x64-{{ ci_runner_version }}.tar.gz' \
+        -o "$archive"
+      echo '{{ ci_runner_sha256 }}  /var/tmp/actions-runner.tar.gz' | sha256sum -c -
+      install -d -o gha-runner -g gha-runner -m 700 /home/gha-runner/actions-runner
+      tar -xzf "$archive" -C /home/gha-runner/actions-runner
+      chown -R gha-runner:gha-runner /home/gha-runner
+      chmod 700 /home/gha-runner
+      rm "$archive"
+      test -x /home/gha-runner/actions-runner/config.sh
+      update-grub
+      systemctl enable serial-getty@ttyS0.service
+      touch /var/lib/ci-image-ready
+runcmd:
+  - ['/usr/local/sbin/ci-prepare-runner']
+final_message: 'CI build cloud-init finished after $UPTIME seconds; check cloud-init status and /var/lib/ci-image-ready.'

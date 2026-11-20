@@ -1,0 +1,69 @@
+- name: Recover only the failed compressed-image conversion stage
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require expected host and storage
+      ansible.builtin.raw: |
+        set -eu
+        test "$(uname -sr)" = 'OpenBSD 8.0'
+        /usr/sbin/rcctl check vmd
+        df -Pk /home | awk 'NR == 2 { if ($4 < 41943040) exit 1 }'
+      changed_when: false
+    - name: Require no running VMs before offline conversion
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_resume_status
+      changed_when: false
+      failed_when: >-
+        not (ci_resume_status.rc in [0, 1] and ci_resume_status.stderr | trim == '' and
+        ci_resume_status.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'))
+    - name: Inspect required build state
+      ansible.builtin.stat:
+        path: '{{ item }}'
+      loop:
+        - /home/vmm-ci/build.lock
+        - /home/vmm-ci/runtime/lock
+        - /home/vmm-ci/build-seed.iso
+        - /home/vmm-ci/build.vm.conf
+      register: ci_resume_files
+    - name: Restrict recovery to a build that has not reached VM loading
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - ci_resume_files.results[0].stat.isdir | default(false)
+          - ci_resume_files.results[1].stat.isdir | default(false)
+          - ci_resume_files.results[2].stat.isreg | default(false)
+          - not ci_resume_files.results[3].stat.exists
+        fail_msg: 'Recovery expects the failed disk-conversion stage, with build locks and seed but no VM definition. Other states require inspection.'
+    - name: Verify cached source image SHA256 again
+      ansible.builtin.stat:
+        path: /home/vmm-ci/ubuntu-cloud.qcow2
+        checksum_algorithm: sha256
+      register: ci_resume_source
+    - name: Require original verified source
+      ansible.builtin.assert:
+        that: ci_resume_source.stat.checksum | default('') == ci_cloud_image_sha256
+    - name: Inspect partial output from the failed native conversion
+      ansible.builtin.stat:
+        path: /home/vmm-ci/base/build.qcow2
+      register: ci_resume_partial
+    - name: Preserve partial output for diagnosis
+      when: ci_resume_partial.stat.exists
+      block:
+        - name: Create private archive directory
+          ansible.builtin.tempfile:
+            state: directory
+            path: /home/vmm-ci/base
+            prefix: failed-build-
+          register: ci_resume_archive
+        - name: Move partial disk without deleting it
+          ansible.builtin.command:
+            argv:
+              - /bin/mv
+              - /home/vmm-ci/base/build.qcow2
+              - '{{ ci_resume_archive.path }}/build.qcow2'
+        - name: Display preserved artifact path
+          ansible.builtin.debug:
+            msg: 'Previous partial disk preserved at {{ ci_resume_archive.path }}/build.qcow2'
+    - name: Continue disk conversion and build VM startup
+      ansible.builtin.import_tasks: tasks/cloud-build-disk.yml

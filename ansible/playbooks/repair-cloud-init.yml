@@ -1,0 +1,150 @@
+- name: Prepare corrected seed for the existing build guest
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  vars:
+    ci_preserve_host_keys: true
+  tasks:
+    - name: Require normal execution
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+    - name: Locate running build guest
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_repair_vms
+      changed_when: false
+    - name: Require only the intended build VM
+      ansible.builtin.assert:
+        that:
+          - ci_repair_vms.stdout_lines | length == 2
+          - ci_repair_vms.stdout_lines[1] is search('\sci-build$')
+          - ci_repair_vms.stdout_lines[1].split()[0] | int < 256
+    - name: Read build public key from controller
+      ansible.builtin.set_fact:
+        ci_builder_public_key: '{{ lookup("ansible.builtin.file", ci_builder_public_key_file) | trim }}'
+    - name: Define trusted existing guest connection
+      ansible.builtin.add_host:
+        name: ci_repair_guest
+        groups: ci_repair_guests
+        ansible_host: '100.64.{{ ci_repair_vms.stdout_lines[1].split()[0] }}.3'
+        ansible_user: ci-builder
+        ansible_become_method: sudo
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o ProxyJump={{ ansible_user }}@{{ ansible_host }} -o ForwardAgent=no'
+        ci_builder_public_key: '{{ ci_builder_public_key }}'
+    - name: Render corrected build user-data
+      ansible.builtin.template:
+        src: ../templates/cloud-user-data.yml.j2
+        dest: /home/vmm-ci/build-seed/user-data
+        mode: '0600'
+    - name: Set new build instance identity
+      ansible.builtin.copy:
+        dest: /home/vmm-ci/build-seed/meta-data
+        content: "instance-id: ci-build-v2\nlocal-hostname: ci-build\n"
+        mode: '0600'
+    - name: Update future nonprivileged job seed too
+      ansible.builtin.template:
+        src: ../templates/job-user-data.yml.j2
+        dest: /home/vmm-ci/job-seed/user-data
+        mode: '0600'
+    - name: Remove only a previous unpublished repair ISO
+      ansible.builtin.file:
+        path: /home/vmm-ci/build-seed.repair.iso
+        state: absent
+    - name: Create corrected ISO without replacing the mounted seed
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/xorriso
+          - -as
+          - mkisofs
+          - -o
+          - /home/vmm-ci/build-seed.repair.iso
+          - -V
+          - cidata
+          - -J
+          - -r
+          - /home/vmm-ci/build-seed
+
+- name: Validate repair in Ubuntu before resetting cloud-init
+  hosts: ci_repair_guests
+  gather_facts: false
+  become: true
+  vars:
+    ci_preserve_host_keys: true
+  tasks:
+    - name: Render candidate for native cloud-init schema validation
+      ansible.builtin.template:
+        src: ../templates/cloud-user-data.yml.j2
+        dest: /var/tmp/ci-repair-user-data.yml
+        mode: '0600'
+    - name: Validate candidate with this guest's cloud-init schema
+      ansible.builtin.command: cloud-init schema -c /var/tmp/ci-repair-user-data.yml
+      changed_when: false
+    - name: Require an unused and unregistered runner
+      ansible.builtin.stat:
+        path: '/home/gha-runner/actions-runner/{{ item }}'
+      loop: ['.runner', '.credentials', '_work']
+      register: ci_repair_usage
+    - name: Refuse cloud-init replay on a used runner
+      ansible.builtin.assert:
+        that: not item.stat.exists
+      loop: '{{ ci_repair_usage.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+    - name: Read completed cloud-init state without hiding degraded errors
+      ansible.builtin.command: cloud-init status --format json
+      register: ci_repair_health
+      changed_when: false
+      failed_when: ci_repair_health.rc not in [0, 2]
+    - name: Require finished state and no unrecoverable errors
+      ansible.builtin.assert:
+        that:
+          - (ci_repair_health.stdout | from_json).status == 'done'
+          - ((ci_repair_health.stdout | from_json).errors | default([])) | length == 0
+    - name: Create private diagnosis backup
+      ansible.builtin.file:
+        path: /var/lib/ci-repair-backup
+        state: directory
+        mode: '0700'
+    - name: Preserve original diagnostic logs and user-data
+      ansible.builtin.copy:
+        src: '{{ item.src }}'
+        dest: '/var/lib/ci-repair-backup/{{ item.name }}'
+        remote_src: true
+        mode: '0600'
+      loop:
+        - {src: /var/log/cloud-init-output.log, name: cloud-init-output.log}
+        - {src: /var/log/cloud-init.log, name: cloud-init.log}
+        - {src: /var/lib/cloud/instance/cloud-config.txt, name: original-cloud-config.yml}
+    - name: Remove old readiness marker so success must be earned again
+      ansible.builtin.file:
+        path: /var/lib/ci-image-ready
+        state: absent
+    - name: Clean instance state without altering machine-id or SSH host keys
+      ansible.builtin.command: cloud-init clean --logs --seed
+    - name: Schedule graceful poweroff after Ansible returns
+      ansible.builtin.command: systemd-run --on-active=5s --collect /usr/bin/systemctl poweroff
+
+- name: Switch seed only after poweroff and rerun cloud-init on the same disk
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Wait for the build guest to power off
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_repair_stopped
+      changed_when: false
+      failed_when: false
+      until: >-
+        ci_repair_stopped.rc in [0, 1] and ci_repair_stopped.stderr | trim == '' and
+        ci_repair_stopped.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$')
+      retries: 15
+      delay: 2
+    - name: Replace seed ISO only while the guest is stopped
+      ansible.builtin.copy:
+        src: /home/vmm-ci/build-seed.repair.iso
+        dest: /home/vmm-ci/build-seed.iso
+        remote_src: true
+        backup: true
+        mode: '0600'
+    - name: Start the same disk with corrected cloud-init data
+      ansible.builtin.import_tasks: tasks/build-vm-start.yml

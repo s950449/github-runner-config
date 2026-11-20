@@ -1,0 +1,53 @@
+- name: Archive a powered-off sealed cloud-init build as runner base
+  hosts: openbsd_hosts
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require normal execution and guest sealing acknowledgement
+      ansible.builtin.assert:
+        that:
+          - not ansible_check_mode
+          - ci_guest_sealed | default(false) | bool
+        fail_msg: 'First run sudo /usr/local/sbin/ci-seal-image inside the build guest. After it powers off, pass -e ci_guest_sealed=true.'
+    - name: Require no running VMs
+      ansible.builtin.command: /usr/sbin/vmctl status -r
+      register: ci_final_status
+      changed_when: false
+      failed_when: >-
+        not (ci_final_status.rc in [0, 1] and ci_final_status.stderr | trim == '' and
+        ci_final_status.stdout is match('^\s*ID\s+PID\s+VCPUS\s+MAXMEM\s+CURMEM\s+TTY\s+OWNER\s+STATE\s+NAME\s*$'))
+    - name: Require build session marker
+      ansible.builtin.stat:
+        path: /home/vmm-ci/build.lock
+      register: ci_final_lock
+    - name: Check existing base
+      ansible.builtin.stat:
+        path: /home/vmm-ci/base/github.qcow2
+      register: ci_final_base
+    - name: Protect existing base and require a build session
+      ansible.builtin.assert:
+        that:
+          - ci_final_lock.stat.isdir | default(false)
+          - not ci_final_base.stat.exists
+    - name: Drop stopped build definition before moving its disk
+      ansible.builtin.command: /usr/sbin/vmctl reload
+    - name: Archive build disk without overwriting any base
+      ansible.builtin.command: /bin/mv /home/vmm-ci/base/build.qcow2 /home/vmm-ci/base/github.qcow2
+    - name: Protect the sealed base
+      ansible.builtin.file:
+        path: /home/vmm-ci/base/github.qcow2
+        owner: root
+        group: wheel
+        mode: '0400'
+    - name: Remove build-only seed and release capacity
+      ansible.builtin.file:
+        path: '{{ item }}'
+        state: absent
+      loop:
+        - /home/vmm-ci/build-seed.iso
+        - /home/vmm-ci/build-seed
+        - /home/vmm-ci/build.lock
+        - /home/vmm-ci/runtime/lock
+    - name: Report prepared base
+      ansible.builtin.debug:
+        msg: 'Sealed base ready. New jobs use only nonprivileged gha-runner SSH access; GitHub registration is still per job.'
